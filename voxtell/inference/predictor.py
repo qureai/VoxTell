@@ -2,6 +2,7 @@ import pydoc
 from queue import Queue
 from threading import Thread
 from typing import List, Tuple, Union
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -17,9 +18,12 @@ from nnunetv2.inference.sliding_window_prediction import compute_gaussian, compu
 from nnunetv2.preprocessing.cropping.cropping import crop_to_nonzero
 from nnunetv2.preprocessing.normalization.default_normalization_schemes import ZScoreNormalization
 from nnunetv2.utilities.helpers import dummy_context, empty_cache
+from nnunetv2.imageio.nibabel_reader_writer import NibabelIOWithReorient
 
 from voxtell.model.voxtell_model import VoxTellModel
 from voxtell.utils.text_embedding import last_token_pool, wrap_with_instruction
+
+import napari
 
 
 class VoxTellPredictor:
@@ -107,7 +111,7 @@ class VoxTellPredictor:
         network.eval()
         self.network = network
 
-    def preprocess(self, data: np.ndarray) -> Tuple[torch.Tensor, Tuple, Tuple[int, ...]]:
+    def preprocess(self, data: np.ndarray) -> Tuple[torch.Tensor, List, Tuple[int, ...]]:
         """
         Preprocess a single image for inference.
         
@@ -130,8 +134,8 @@ class VoxTellPredictor:
         original_shape = data.shape[1:]
         data, _, bbox = crop_to_nonzero(data, None)
         data = self.normalization.run(data, None)
-        data = torch.from_numpy(data)
-        return data, bbox, original_shape
+        data_tensor = torch.from_numpy(data)
+        return data_tensor, bbox, original_shape
     
     def _internal_get_sliding_window_slicers(self, image_size: Tuple[int, ...]) -> List[Tuple]:
         """
@@ -170,16 +174,18 @@ class VoxTellPredictor:
         return slicers
     
     @torch.inference_mode()
-    def embed_text_prompts(self, text_prompts: Union[List[str], str]) -> torch.Tensor:
+    def embed_text_prompts(self, text_prompts: Union[List[str], str],
+                           use_empty_cache: bool = True) -> torch.Tensor:
         """
         Embed text prompts into vector representations.
-        
+
         This function converts free-text anatomical descriptions into embeddings
         using the text backbone model.
-        
+
         Args:
             text_prompts: Single text prompt or list of text prompts.
-            
+            use_empty_cache: If True, call empty_cache after moving text backbone to CPU.
+
         Returns:
             Text embeddings tensor of shape (1, num_prompts, embedding_dim).
         """
@@ -201,25 +207,29 @@ class VoxTellPredictor:
         embeddings = last_token_pool(text_embed.last_hidden_state, text_tokens['attention_mask'])
         embeddings = embeddings.view(1, n_prompts, -1)
         self.text_backbone = self.text_backbone.to('cpu')
-        empty_cache(self.device)
+        if use_empty_cache:
+            empty_cache(self.device)
         return embeddings
 
     @torch.inference_mode()
     def predict_sliding_window_return_logits(
         self,
         input_image: torch.Tensor,
-        text_embeddings: torch.Tensor
+        text_embeddings: torch.Tensor,
+        use_empty_cache: bool = True,
+        show_progress: bool = True,
     ) -> torch.Tensor:
         """
         Perform sliding window inference to generate segmentation logits.
-        
+
         Args:
             input_image: Input image tensor of shape (C, X, Y, Z).
             text_embeddings: Text embeddings from embed_text_prompts.
-            
+            use_empty_cache: If True, call empty_cache before and after sliding window inference.
+
         Returns:
             Predicted logits tensor.
-            
+
         Raises:
             ValueError: If input_image is not 4D or not a torch.Tensor.
         """
@@ -229,10 +239,11 @@ class VoxTellPredictor:
             raise ValueError(
                 f"input_image must be 4D (C, X, Y, Z), got shape {input_image.shape}"
             )
-        
+
         self.network = self.network.to(self.device)
 
-        empty_cache(self.device)
+        if use_empty_cache:
+            empty_cache(self.device)
         with torch.autocast(self.device.type, enabled=True) if self.device.type == 'cuda' else dummy_context():
 
             # if input_image is smaller than tile_size we need to pad it to tile_size.
@@ -242,10 +253,13 @@ class VoxTellPredictor:
             slicers = self._internal_get_sliding_window_slicers(data.shape[1:])
 
             predicted_logits = self._internal_predict_sliding_window_return_logits(
-                data, text_embeddings, slicers, self.perform_everything_on_device
+                data, text_embeddings, slicers, self.perform_everything_on_device,
+                use_empty_cache=use_empty_cache,
+                show_progress=show_progress,
             )
 
-            empty_cache(self.device)
+            if use_empty_cache:
+                empty_cache(self.device)
             # Revert padding
             predicted_logits = predicted_logits[(slice(None), *slicer_revert_padding[1:])]
         return predicted_logits
@@ -257,22 +271,25 @@ class VoxTellPredictor:
         text_embeddings: torch.Tensor,
         slicers: List[Tuple],
         do_on_device: bool = True,
+        use_empty_cache: bool = True,
+        show_progress: bool = True,
     ) -> torch.Tensor:
         """
         Internal method for sliding window prediction with Gaussian weighting.
-        
+
         Uses a producer-consumer pattern with threading to overlap data loading
         and model inference.
-        
+
         Args:
             data: Preprocessed image data.
             text_embeddings: Text embeddings for prompts.
             slicers: List of slice tuples for patch extraction.
             do_on_device: If True, keep all tensors on GPU during computation.
-            
+            use_empty_cache: If True, call empty_cache before inference.
+
         Returns:
             Aggregated prediction logits.
-            
+
         Raises:
             RuntimeError: If inf values are encountered in predictions.
         """
@@ -288,7 +305,8 @@ class VoxTellPredictor:
                 queue.put((patch, slicer))
             queue.put('end')
 
-        empty_cache(self.device)
+        if use_empty_cache:
+            empty_cache(self.device)
 
         # move data to device
         data = data.to(results_device)
@@ -309,7 +327,7 @@ class VoxTellPredictor:
             device=results_device
         )
 
-        with tqdm(desc=None, total=len(slicers)) as pbar:
+        with tqdm(desc=None, total=len(slicers), disable=not show_progress) as pbar:
             while True:
                 item = queue.get()
                 if item == 'end':
@@ -339,40 +357,60 @@ class VoxTellPredictor:
     def predict_single_image(
         self,
         data: np.ndarray,
-        text_prompts: Union[str, List[str]]
+        text_prompts: Union[str, List[str]],
+        use_empty_cache: bool = True,
+        text_embedding: Union[torch.Tensor, None] = None,
+        return_score: bool = False,
+        show_progress: bool = True,
     ) -> np.ndarray:
         """
-        Predict segmentation masks for a single image with text prompts.
-        
+        Predict segmentation masks or per-pixel scores for a single image with text prompts.
+
         This is the main prediction method that orchestrates preprocessing,
         text embedding, sliding window inference, and postprocessing.
-        
+
         Args:
             data: Image data in RAS orientation (3D or 4D with channel dimension).
             text_prompts: Single text prompt or list of text prompts describing
                 anatomical structures to segment.
-                
+            use_empty_cache: If True, call empty_cache at intermediate steps to free
+                GPU memory. Disable if memory is managed externally.
+            text_embedding: Precomputed text embeddings. If provided, text_prompts
+                is only used to determine the number of outputs.
+            return_score: If True, return per-pixel sigmoid probabilities (float32)
+                instead of binary masks (uint8).
+
         Returns:
-            Segmentation masks as numpy array of shape (num_prompts, X, Y, Z)
-            with binary values (0 or 1) indicating the segmented regions.
+            If return_score is False (default): segmentation masks as numpy array of
+                shape (num_prompts, X, Y, Z) with binary values (0 or 1).
+            If return_score is True: per-pixel sigmoid scores as numpy array of
+                shape (num_prompts, X, Y, Z) with float32 values in [0, 1].
         """
 
         # Preprocess image
-        data, bbox, orig_shape = self.preprocess(data)
+        data_tensor, bbox, orig_shape = self.preprocess(data)
 
         # Embed text prompts
-        embeddings = self.embed_text_prompts(text_prompts)
+        if text_embedding is not None:
+            embeddings = text_embedding.to(self.device)
+        else:
+            embeddings = self.embed_text_prompts(text_prompts, use_empty_cache=use_empty_cache)
 
         # Predict segmentation logits
-        prediction = self.predict_sliding_window_return_logits(data, embeddings).to('cpu')
+        prediction = self.predict_sliding_window_return_logits(
+            data_tensor, embeddings, use_empty_cache=use_empty_cache,
+            show_progress=show_progress,
+        ).to('cpu')
 
-        # Postprocess logits to get binary segmentation masks
+        # Postprocess logits
         with torch.no_grad():
-            prediction = torch.sigmoid(prediction.float()) > 0.5
-        
+            scores = torch.sigmoid(prediction.float())
+            prediction = scores if return_score else (scores > 0.5)
+
+        out_dtype = np.float32 if return_score else np.uint8
         segmentation_reverted_cropping = np.zeros(
             [prediction.shape[0], *orig_shape],
-            dtype=np.uint8
+            dtype=out_dtype
         )
         segmentation_reverted_cropping = insert_crop_into_image(
             segmentation_reverted_cropping, prediction, bbox
@@ -382,8 +420,6 @@ class VoxTellPredictor:
 
 
 if __name__ == '__main__':
-    from pathlib import Path
-    from nnunetv2.imageio.nibabel_reader_writer import NibabelIOWithReorient
 
     # Default paths - modify these as needed
     DEFAULT_IMAGE_PATH = "/path/to/your/image.nii.gz"
@@ -403,7 +439,6 @@ if __name__ == '__main__':
     voxtell_seg = predictor.predict_single_image(img, text_prompts)
     
     # Visualize results, we reccommend using napari for 3D visualization
-    import napari
     viewer = napari.Viewer()
     viewer.add_image(img, name='image')
     for i, prompt in enumerate(text_prompts):
