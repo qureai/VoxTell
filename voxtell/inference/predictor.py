@@ -111,20 +111,22 @@ class VoxTellPredictor:
         network.eval()
         self.network = network
 
-    def preprocess(self, data: np.ndarray) -> Tuple[torch.Tensor, List, Tuple[int, ...]]:
+    def preprocess(self, data: np.ndarray, do_crop_to_nonzero: bool = True) -> Tuple[torch.Tensor, List, Tuple[int, ...]]:
         """
         Preprocess a single image for inference.
-        
+
         This function preprocesses an image already in RAS orientation by performing
-        cropping to non-zero regions and z-score normalization.
-        
+        optional cropping to non-zero regions and z-score normalization.
+
         Args:
             data: Image data in RAS orientation (3D or 4D with channel dimension).
-            
+            do_crop_to_nonzero: If True, crop image to non-zero bounding box before
+                normalization. Set to False to preserve the full image shape.
+
         Returns:
             Tuple containing:
                 - Preprocessed image tensor
-                - Bounding box of cropped region
+                - Bounding box of cropped region (None if do_crop_to_nonzero is False)
                 - Original image shape
         """
 
@@ -132,11 +134,54 @@ class VoxTellPredictor:
             data = data[None]  # add channel axis
         data = data.astype(np.float32)  # this creates a copy
         original_shape = data.shape[1:]
-        data, _, bbox = crop_to_nonzero(data, None)
+        if do_crop_to_nonzero:
+            data, _, bbox = crop_to_nonzero(data, None)
+        else:
+            bbox = None
         data = self.normalization.run(data, None)
         data_tensor = torch.from_numpy(data)
         return data_tensor, bbox, original_shape
     
+    @torch.inference_mode()
+    def get_encoder_embedding(
+        self,
+        data: Union[np.ndarray, torch.Tensor],
+        encoder_layer_numbers: List[int],
+    ) -> dict[int, torch.Tensor]:
+        """
+        Get encoder feature embeddings for a CT image (or batch) at multiple layers.
+
+        The encoder is run exactly once regardless of how many layers are requested.
+
+        Args:
+            data: One of:
+                - ``np.ndarray`` of shape ``(D, H, W)`` or ``(C, D, H, W)``:
+                  preprocessed via :meth:`preprocess` (no crop) and a batch
+                  dimension is added automatically.
+                - ``torch.Tensor`` of shape ``(B, C, D, H, W)``: already
+                  preprocessed (normalized) batch; moved to the model device
+                  as-is.
+            encoder_layer_numbers: List of encoder stage indices whose feature
+                maps should be returned. 0 is the shallowest (highest resolution)
+                and ``n_stages - 1`` is the bottleneck. Negative indices are
+                supported.
+
+        Returns:
+            Dict mapping each requested layer index to its feature tensor of
+            shape ``(B, C_l, D_l, H_l, W_l)``.
+        """
+        if isinstance(data, np.ndarray):
+            data_tensor, _, _ = self.preprocess(data, do_crop_to_nonzero=False)
+            # (C, D, H, W) -> (1, C, D, H, W)
+            data_tensor = data_tensor.unsqueeze(0).to(self.device)
+        else:
+            data_tensor = data.to(self.device)
+
+        self.network = self.network.to(self.device)
+        skips = self.network.encoder(data_tensor)
+
+        return {layer: skips[layer] for layer in encoder_layer_numbers}
+
     def _internal_get_sliding_window_slicers(self, image_size: Tuple[int, ...]) -> List[Tuple]:
         """
         Generate sliding window slicers for patch-based inference.
