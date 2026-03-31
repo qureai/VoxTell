@@ -81,12 +81,17 @@ class CTDataset(Dataset):
     def __len__(self) -> int:
         return len(self.ct_paths)
 
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, str]:
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, str, bool]:
         ct_path = Path(self.ct_paths[idx])
         ct_stem = _ct_stem(ct_path)
 
-        ct_tensors = load_file(str(ct_path))
-        img = ct_tensors.get('ct_data', ct_tensors[next(iter(ct_tensors))])
+        try:
+            ct_tensors = load_file(str(ct_path))
+            img = ct_tensors.get('ct_data', ct_tensors[next(iter(ct_tensors))])
+        except Exception as e:
+            print(f"Failed to load {ct_path}: {e}")
+            img = torch.zeros(1, *self.model_input_shape)
+            return img, ct_stem, False
 
         # Ensure float32 and shape (1, C, D, H, W) for interpolate
         img = img.float()
@@ -110,7 +115,7 @@ class CTDataset(Dataset):
         std = img.std()
         img = (img - mean) / (std + 1e-8)
 
-        return img, ct_stem
+        return img, ct_stem, True
 
 
 def _flush_chunk(results: dict, dump_file: str, rank: int, chunk_idx: int) -> None:
@@ -187,7 +192,7 @@ def _worker(
         disable=not show_progress,
     )
 
-    for batch_imgs, batch_stems in pbar:
+    for batch_imgs, batch_stems, batch_valid in pbar:
         if show_progress:
             pbar.set_postfix_str(f"batch size: {batch_imgs.shape[0]}")
 
@@ -203,9 +208,14 @@ def _worker(
                 for b, ct_stem in enumerate(batch_stems):
                     results[f"{ct_stem}_layer{layer_num}"] = emb_cpu[b].numpy()
 
+            for b, ct_stem in enumerate(batch_stems):
+                results[f"{ct_stem}_valid"] = np.array(batch_valid[b].item(), dtype=bool)
+
         except Exception:
             stems = list(batch_stems)
             print(f"[rank {rank}] ERROR on batch {stems}:\n{traceback.format_exc()}")
+            for ct_stem in stems:
+                results[f"{ct_stem}_valid"] = np.array(False, dtype=bool)
 
         batch_count += 1
         if batch_count % save_every_n_batches == 0:
@@ -241,6 +251,8 @@ def run(
     num_workers: int,
     save_every_n_batches: int,
     show_progress: bool = False,
+    start_idx: int = 0,
+    end_idx: int = -1,
 ) -> None:
     """
     Main entry point for batch encoder embedding extraction.
@@ -260,12 +272,21 @@ def run(
         num_workers: DataLoader worker processes per GPU.
         save_every_n_batches: Flush results to disk after this many batches.
         show_progress: If True, display per-rank tqdm progress bars.
+        start_idx: Start index (inclusive) into the CT list (default: 0).
+        end_idx: End index (exclusive) into the CT list; -1 means end of list (default: -1).
     """
     with open(ct_list_file) as f:
         ct_paths = [line.strip() for line in f if line.strip()]
 
     if not ct_paths:
         raise ValueError(f"No CT paths found in {ct_list_file}")
+
+    end = end_idx if end_idx != -1 else len(ct_paths)
+    ct_paths = ct_paths[start_idx:end]
+    print(f"Processing CT indices [{start_idx}:{end}] — {len(ct_paths)} volume(s).")
+
+    if not ct_paths:
+        raise ValueError(f"No CT paths in range [{start_idx}:{end}]")
 
     print(
         f"Found {len(ct_paths)} CT volumes | {len(encoder_layer_numbers)} layer(s) | "
@@ -349,6 +370,14 @@ def main() -> None:
         '--show_progress', action='store_true', default=False,
         help='Display a tqdm progress bar for each GPU worker (default: off).',
     )
+    parser.add_argument(
+        '--start_idx', type=int, default=0,
+        help='Start index (inclusive) into the CT list (default: 0).',
+    )
+    parser.add_argument(
+        '--end_idx', type=int, default=-1,
+        help='End index (exclusive) into the CT list; -1 means end of list (default: -1).',
+    )
     args = parser.parse_args()
 
     run(
@@ -363,6 +392,8 @@ def main() -> None:
         num_workers=args.num_workers,
         save_every_n_batches=args.save_every_n_batches,
         show_progress=args.show_progress,
+        start_idx=args.start_idx,
+        end_idx=args.end_idx,
     )
 
 
