@@ -24,53 +24,20 @@ from voxtell.model.voxtell_model import VoxTellModel
 from voxtell.utils.text_embedding import last_token_pool, wrap_with_instruction
 
 class VoxTellPredictor:
-    """
-    Predictor for VoxTell segmentation model.
-    
-    This class handles loading the VoxTell model, preprocessing images,
-    embedding text prompts, and performing sliding window inference to generate
-    segmentation masks based on free-text anatomical descriptions.
-    
-    Attributes:
-        device: PyTorch device for inference.
-        network: The VoxTell model.
-        tokenizer: Text tokenizer for prompt encoding.
-        text_backbone: Text embedding model.
-        patch_size: Patch size for sliding window inference.
-        tile_step_size: Step size for sliding window (default: 0.5 = 50% overlap).
-        perform_everything_on_device: Keep all tensors on device during inference.
-        max_text_length: Maximum text prompt length in tokens.
-    """
     def __init__(self, model_dir: str, device: torch.device = torch.device('cuda'),
                  text_encoding_model: str = 'Qwen/Qwen3-Embedding-4B') -> None:
-        """
-        Initialize the VoxTell predictor.
-
-        Args:
-            model_dir: Path to model directory containing plans.json and checkpoint.
-            device: PyTorch device to use for inference (default: cuda).
-            text_encoding_model: Pretrained text encoding model (Qwen/Qwen3-Embedding-4B).
-
-        Raises:
-            FileNotFoundError: If model files are not found.
-            RuntimeError: If model loading fails.
-        """
-        # Device setup
         self.device = device
         if device.type == 'cuda':
             torch.backends.cudnn.benchmark = True
         self.normalization = ZScoreNormalization(intensityproperties={})
 
-        # Predictor settings
         self.tile_step_size = 0.5
         self.perform_everything_on_device = True
 
-        # Embedding model
         self.tokenizer = AutoTokenizer.from_pretrained(text_encoding_model, padding_side='left')
         self.text_backbone = AutoModel.from_pretrained(text_encoding_model).eval()
         self.max_text_length = 8192
 
-        # Load network settings
         plans = load_json(join(model_dir, 'plans.json'))
         arch_kwargs = plans['configurations']['3d_fullres']['architecture']['arch_kwargs']
         self.patch_size = plans['configurations']['3d_fullres']['patch_size']
@@ -80,7 +47,6 @@ class VoxTellPredictor:
             if arch_kwargs[required_import_key] is not None:
                 arch_kwargs[required_import_key] = pydoc.locate(arch_kwargs[required_import_key])
 
-        # Instantiate network
         network = VoxTellModel(
             input_channels=1,
             **arch_kwargs,
@@ -93,7 +59,6 @@ class VoxTellPredictor:
             deep_supervision=False
         )
 
-        # Load weights
         checkpoint = torch.load(
             join(model_dir, 'fold_0', 'checkpoint_final.pth'),
             map_location=torch.device('cpu'),
@@ -107,31 +72,12 @@ class VoxTellPredictor:
         
         network.eval()
         self.network = network.to(device)
-        # Gaussian kernel is the same for every volume; cache per (patch_size, device).
         self._gaussian_cache: dict = {}
 
     def preprocess(self, data: np.ndarray, do_crop_to_nonzero: bool = True) -> Tuple[torch.Tensor, List, Tuple[int, ...]]:
-        """
-        Preprocess a single image for inference.
-
-        This function preprocesses an image already in RAS orientation by performing
-        optional cropping to non-zero regions and z-score normalization.
-
-        Args:
-            data: Image data in RAS orientation (3D or 4D with channel dimension).
-            do_crop_to_nonzero: If True, crop image to non-zero bounding box before
-                normalization. Set to False to preserve the full image shape.
-
-        Returns:
-            Tuple containing:
-                - Preprocessed image tensor
-                - Bounding box of cropped region (None if do_crop_to_nonzero is False)
-                - Original image shape
-        """
-
         if data.ndim == 3:
-            data = data[None]  # add channel axis
-        data = data.astype(np.float32)  # this creates a copy
+            data = data[None] 
+        data = data.astype(np.float32)
         original_shape = data.shape[1:]
         if do_crop_to_nonzero:
             data, _, bbox = crop_to_nonzero(data, None)
@@ -142,39 +88,17 @@ class VoxTellPredictor:
         return data_tensor, bbox, original_shape
 
     def preprocess_gpu(self, data: torch.Tensor) -> Tuple[torch.Tensor, List, Tuple[int, ...]]:
-        """
-        GPU-accelerated equivalent of ``preprocess()``.
-
-        Performs crop-to-nonzero and z-score normalisation entirely on the GPU,
-        eliminating the CPU numpy round-trip.  The returned tensor and its bbox
-        are compatible with ``predict_sliding_window_return_logits`` and the GPU
-        crop-reversion idiom in ``segmentation_wrapper``.
-
-        Args:
-            data: Float32 tensor of shape ``(1, X, Y, Z)`` already on the target
-                device.
-
-        Returns:
-            Tuple of (normalised_tensor, bbox, original_shape) where:
-                - normalised_tensor has shape ``(1, X_crop, Y_crop, Z_crop)``
-                - bbox is ``[[d0_min, d0_max], [d1_min, d1_max], [d2_min, d2_max]]``
-                  matching nnunetv2's crop_to_nonzero convention
-                - original_shape is ``(X, Y, Z)``
-        """
         assert data.ndim == 4 and data.shape[0] == 1, "Expected (1, X, Y, Z)"
         orig_shape: Tuple[int, ...] = tuple(data.shape[1:])
 
-        # Crop to nonzero bounding box — equivalent to nnunetv2 crop_to_nonzero.
-        # Project along pairs of axes to get a 1-D nonzero mask per axis instead of
-        # materialising a full (N, 3) index tensor (avoids up to ~1.6 GB on 512³ volumes).
-        mask = data[0] != 0  # (X, Y, Z) bool
-        proj0 = mask.any(2).any(1)  # (X,) — True if any voxel in that X-slice is nonzero
+        mask = data[0] != 0
+        proj0 = mask.any(2).any(1)
         if not proj0.any():
             bbox = [[0, s] for s in orig_shape]
             cropped = data
         else:
-            proj1 = mask.any(2).any(0)  # (Y,)
-            proj2 = mask.any(1).any(0)  # (Z,)
+            proj1 = mask.any(2).any(0)
+            proj2 = mask.any(1).any(0)
             nz0 = proj0.nonzero(as_tuple=False)
             nz1 = proj1.nonzero(as_tuple=False)
             nz2 = proj2.nonzero(as_tuple=False)
@@ -190,7 +114,6 @@ class VoxTellPredictor:
                 bbox[2][0]:bbox[2][1],
             ]
 
-        # Z-score normalisation — matches ZScoreNormalization(intensityproperties={}).run()
         mean = cropped.mean()
         std = cropped.std()
         normalized = (cropped - mean) / (std + 1e-8)
@@ -202,56 +125,19 @@ class VoxTellPredictor:
         data: Union[np.ndarray, torch.Tensor],
         encoder_layer_numbers: List[int],
     ) -> dict[int, torch.Tensor]:
-        """
-        Get encoder feature embeddings for a CT image (or batch) at multiple layers.
-
-        The encoder is run exactly once regardless of how many layers are requested.
-
-        Args:
-            data: One of:
-                - ``np.ndarray`` of shape ``(D, H, W)`` or ``(C, D, H, W)``:
-                  preprocessed via :meth:`preprocess` (no crop) and a batch
-                  dimension is added automatically.
-                - ``torch.Tensor`` of shape ``(B, C, D, H, W)``: already
-                  preprocessed (normalized) batch; moved to the model device
-                  as-is.
-            encoder_layer_numbers: List of encoder stage indices whose feature
-                maps should be returned. 0 is the shallowest (highest resolution)
-                and ``n_stages - 1`` is the bottleneck. Negative indices are
-                supported.
-
-        Returns:
-            Dict mapping each requested layer index to its feature tensor of
-            shape ``(B, C_l, D_l, H_l, W_l)``.
-        """
         if isinstance(data, np.ndarray):
             data_tensor, _, _ = self.preprocess(data, do_crop_to_nonzero=False)
-            # (C, D, H, W) -> (1, C, D, H, W)
             data_tensor = data_tensor.unsqueeze(0).to(self.device)
         else:
             data_tensor = data.to(self.device)
 
         skips = self.network.encoder(data_tensor)
-
         return {layer: skips[layer] for layer in encoder_layer_numbers}
 
     def _internal_get_sliding_window_slicers(self, image_size: Tuple[int, ...]) -> List[Tuple]:
-        """
-        Generate sliding window slicers for patch-based inference.
-        
-        Args:
-            image_size: Shape of the input image.
-            
-        Returns:
-            List of slice tuples for extracting patches.
-        """
         slicers = []
         if len(self.patch_size) < len(image_size):
-            assert len(self.patch_size) == len(image_size) - 1, (
-                'if tile_size has less entries than image_size, '
-                'len(tile_size) must be one shorter than len(image_size) '
-                '(only dimension discrepancy of 1 allowed).'
-            )
+            assert len(self.patch_size) == len(image_size) - 1
             steps = compute_steps_for_sliding_window(image_size[1:], self.patch_size,
                                                      self.tile_step_size)
             for d in range(image_size[0]):
@@ -274,19 +160,6 @@ class VoxTellPredictor:
     @torch.inference_mode()
     def embed_text_prompts(self, text_prompts: Union[List[str], str],
                            use_empty_cache: bool = True) -> torch.Tensor:
-        """
-        Embed text prompts into vector representations.
-
-        This function converts free-text anatomical descriptions into embeddings
-        using the text backbone model.
-
-        Args:
-            text_prompts: Single text prompt or list of text prompts.
-            use_empty_cache: If True, call empty_cache after moving text backbone to CPU.
-
-        Returns:
-            Text embeddings tensor of shape (1, num_prompts, embedding_dim).
-        """
         if isinstance(text_prompts, str):
             text_prompts = [text_prompts]
         n_prompts = len(text_prompts)
@@ -318,35 +191,15 @@ class VoxTellPredictor:
         show_progress: bool = True,
         patch_batch_size: int = 1,
     ) -> torch.Tensor:
-        """
-        Perform sliding window inference to generate segmentation logits.
-
-        Args:
-            input_image: Input image tensor of shape (C, X, Y, Z).
-            text_embeddings: Text embeddings from embed_text_prompts.
-            use_empty_cache: If True, call empty_cache before and after sliding window inference.
-            patch_batch_size: Number of sliding-window patches to process in a single
-                forward pass. Values > 1 improve GPU utilisation at the cost of
-                proportionally more VRAM. Start with 2 and increase while VRAM allows.
-
-        Returns:
-            Predicted logits tensor.
-
-        Raises:
-            ValueError: If input_image is not 4D or not a torch.Tensor.
-        """
         if not isinstance(input_image, torch.Tensor):
             raise ValueError(f"input_image must be a torch.Tensor, got {type(input_image)}")
-        if input_image.ndim != 4:
-            raise ValueError(
-                f"input_image must be 4D (C, X, Y, Z), got shape {input_image.shape}"
-            )
-
+        
         if use_empty_cache:
             empty_cache(self.device)
-        with torch.autocast(self.device.type, enabled=True) if self.device.type == 'cuda' else dummy_context():
-
-            # if input_image is smaller than tile_size we need to pad it to tile_size.
+            
+        # OPTIMIZATION: L40 (Ada Lovelace) natively accelerates bfloat16 massively better than float16
+        amp_dtype = torch.bfloat16 if self.device.type == 'cuda' else torch.float32
+        with torch.autocast(self.device.type, dtype=amp_dtype, enabled=True) if self.device.type == 'cuda' else dummy_context():
             data, slicer_revert_padding = pad_nd_image(input_image, self.patch_size,
                                                        'constant', {'value': 0}, True, None)
 
@@ -361,7 +214,6 @@ class VoxTellPredictor:
 
             if use_empty_cache:
                 empty_cache(self.device)
-            # Revert padding
             predicted_logits = predicted_logits[(slice(None), *slicer_revert_padding[1:])]
         return predicted_logits
 
@@ -376,42 +228,12 @@ class VoxTellPredictor:
         show_progress: bool = True,
         patch_batch_size: int = 1,
     ) -> torch.Tensor:
-        """
-        Internal method for sliding window prediction with Gaussian weighting.
-
-        Uses a producer-consumer pattern with threading to overlap data loading
-        and model inference.  When ``patch_batch_size > 1`` the producer groups
-        patches into micro-batches and the consumer runs a single forward pass
-        per micro-batch, improving GPU utilisation.
-
-        Args:
-            data: Preprocessed image data.
-            text_embeddings: Text embeddings for prompts, shape (1, P, emb_dim).
-            slicers: List of slice tuples for patch extraction.
-            do_on_device: If True, keep all tensors on GPU during computation.
-            use_empty_cache: If True, call empty_cache before inference.
-            patch_batch_size: Number of patches per forward pass.
-
-        Returns:
-            Aggregated prediction logits.
-
-        Raises:
-            RuntimeError: If inf values are encountered in predictions.
-        """
         results_device = self.device if do_on_device else torch.device('cpu')
 
         def producer(data_tensor, slicer_list, queue, batch_size):
-            """Producer thread: groups patches into micro-batches and enqueues them.
-
-            data_tensor is already on results_device (GPU), so clones stay on GPU
-            and no .to() transfer is needed.
-            """
             batch_patches, batch_slicers = [], []
             for slicer in slicer_list:
-                patch = torch.clone(
-                    data_tensor[slicer][None],
-                    memory_format=torch.contiguous_format,
-                )  # (1, C, px, py, pz) — already on results_device
+                patch = data_tensor[slicer][None].contiguous()
                 batch_patches.append(patch)
                 batch_slicers.append(slicer)
                 if len(batch_patches) == batch_size:
@@ -424,14 +246,11 @@ class VoxTellPredictor:
         if use_empty_cache:
             empty_cache(self.device)
 
-        # data is expected to already be on the GPU when called from the hot path;
-        # .to() is a no-op if already on results_device.
         data = data.to(results_device)
         queue = Queue(maxsize=4)
         t = Thread(target=producer, args=(data, slicers, queue, patch_batch_size))
         t.start()
 
-        # Preallocate accumulation buffers on device.
         predicted_logits = torch.zeros(
             (text_embeddings.shape[1], *data.shape[1:]),
             dtype=torch.half,
@@ -439,7 +258,6 @@ class VoxTellPredictor:
         )
         n_predictions = torch.zeros(data.shape[1:], dtype=torch.half, device=results_device)
 
-        # Cache gaussian — same kernel for every volume on this worker.
         cache_key = (tuple(self.patch_size), str(results_device))
         if cache_key not in self._gaussian_cache:
             self._gaussian_cache[cache_key] = compute_gaussian(
@@ -457,21 +275,24 @@ class VoxTellPredictor:
                     queue.task_done()
                     break
                 patches, tile_slicers = item
-                # patches: (N, C, px, py, pz) on results_device
-                # Expand text_embeddings from (1, P, emb_dim) to (N, P, emb_dim) — zero-copy view.
                 n = patches.shape[0]
                 text_emb_batch = text_embeddings.expand(n, -1, -1)
-                predictions = self.network(patches, text_emb_batch)  # (N, P, px, py, pz)
-                for pred, tile_slice in zip(predictions, tile_slicers):
-                    # pred is already on results_device — no .to() needed.
-                    pred = pred * gaussian
-                    predicted_logits[tile_slice] += pred
-                    n_predictions[tile_slice[1:]] += gaussian
+                
+                predictions = self.network(patches, text_emb_batch)
+                
+                # OPTIMIZATION: IN-PLACE MEMORY ACCUMULATION
+                # This prevents PyTorch from allocating hundreds of new tensors,
+                # halving the VRAM bandwidth requirement.
+                for i, tile_slice in enumerate(tile_slicers):
+                    pred = predictions[i]
+                    pred.mul_(gaussian)  # In-place multiply
+                    predicted_logits[tile_slice].add_(pred)  # In-place add
+                    n_predictions[tile_slice[1:]].add_(gaussian)  # In-place add
+                
                 queue.task_done()
                 pbar.update(n)
         queue.join()
 
-        # Normalize by number of predictions per voxel
         torch.div(predicted_logits, n_predictions, out=predicted_logits)
         return predicted_logits
 
@@ -484,46 +305,18 @@ class VoxTellPredictor:
         return_score: bool = False,
         show_progress: bool = True,
     ) -> np.ndarray:
-        """
-        Predict segmentation masks or per-pixel scores for a single image with text prompts.
-
-        This is the main prediction method that orchestrates preprocessing,
-        text embedding, sliding window inference, and postprocessing.
-
-        Args:
-            data: Image data in RAS orientation (3D or 4D with channel dimension).
-            text_prompts: Single text prompt or list of text prompts describing
-                anatomical structures to segment.
-            use_empty_cache: If True, call empty_cache at intermediate steps to free
-                GPU memory. Disable if memory is managed externally.
-            text_embedding: Precomputed text embeddings. If provided, text_prompts
-                is only used to determine the number of outputs.
-            return_score: If True, return per-pixel sigmoid probabilities (float32)
-                instead of binary masks (uint8).
-
-        Returns:
-            If return_score is False (default): segmentation masks as numpy array of
-                shape (num_prompts, X, Y, Z) with binary values (0 or 1).
-            If return_score is True: per-pixel sigmoid scores as numpy array of
-                shape (num_prompts, X, Y, Z) with float32 values in [0, 1].
-        """
-
-        # Preprocess image
         data_tensor, bbox, orig_shape = self.preprocess(data)
 
-        # Embed text prompts
         if text_embedding is not None:
             embeddings = text_embedding.to(self.device)
         else:
             embeddings = self.embed_text_prompts(text_prompts, use_empty_cache=use_empty_cache)
 
-        # Predict segmentation logits
         prediction = self.predict_sliding_window_return_logits(
             data_tensor, embeddings, use_empty_cache=use_empty_cache,
             show_progress=show_progress,
         ).to('cpu')
 
-        # Postprocess logits
         with torch.no_grad():
             scores = torch.sigmoid(prediction.float())
             prediction = scores if return_score else (scores > 0.5)
@@ -543,24 +336,19 @@ class VoxTellPredictor:
 if __name__ == '__main__':
     import napari
 
-    # Default paths - modify these as needed
     DEFAULT_IMAGE_PATH = "/path/to/your/image.nii.gz"
     DEFAULT_MODEL_DIR = "/path/to/your/model/directory"
     
-    # Configuration
     image_path = DEFAULT_IMAGE_PATH
     model_dir = DEFAULT_MODEL_DIR
     text_prompts = ["liver", "right kidney", "left kidney", "spleen"]
     device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
     
-    # Load image
     img, props = NibabelIOWithReorient().read_images([image_path])
     
-    # Initialize predictor and run inference
     predictor = VoxTellPredictor(model_dir=model_dir, device=device)
     voxtell_seg = predictor.predict_single_image(img, text_prompts)
     
-    # Visualize results, we reccommend using napari for 3D visualization
     viewer = napari.Viewer()
     viewer.add_image(img, name='image')
     for i, prompt in enumerate(text_prompts):
