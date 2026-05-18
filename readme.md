@@ -125,6 +125,7 @@ model_path = f"{download_path}/{MODEL_NAME}"
 
 ### Command-Line Interface (CLI)
 
+
 VoxTell provides a convenient command-line interface for running predictions:
 
 ```bash
@@ -167,6 +168,14 @@ voxtell-predict -i case001.nii.gz -o output_folder -m /path/to/model -p "liver" 
 | `--verbose` | | No | Enable verbose output |
 
 ---
+
+### Run Inference on Multiple GPUs
+
+For running inference on multiple gpus, use the provided bash script:
+
+```bash
+bash run_seg_inference_gemini.sh
+```
 
 ### Python API
 
